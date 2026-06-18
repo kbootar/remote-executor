@@ -1,0 +1,9 @@
+spring:
+  web:
+    resources:
+      # Serves kbootar-web/ at http://localhost:8080/ — same origin as /api/execute, no CORS needed
+      static-locations: classpath:/static/, file:../kbootar-web/
+
+logging:
+  level:
+    in.neuw.kbootar: DEBUG
