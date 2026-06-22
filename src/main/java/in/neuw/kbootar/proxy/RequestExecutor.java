@@ -4,7 +4,9 @@ import in.neuw.kbootar.auth.TokenCacheService;
 import in.neuw.kbootar.collection.ApiRequest;
 import in.neuw.kbootar.collection.AuthType;
 import in.neuw.kbootar.collection.Environment;
-import in.neuw.kbootar.collection.TlsConfig;
+import in.neuw.kbootar.tls.DomainTlsProperties.DomainEntry;
+import in.neuw.kbootar.tls.DomainTlsProperties.Kind;
+import in.neuw.kbootar.tls.DomainTlsRegistry;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import org.slf4j.Logger;
@@ -19,15 +21,19 @@ import reactor.netty.http.HttpProtocol;
 import reactor.netty.http.client.HttpClient;
 
 import javax.net.ssl.KeyManagerFactory;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.net.URI;
 import java.security.KeyStore;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.time.Duration;
+import java.time.Instant;
 
 @Service
 public class RequestExecutor {
@@ -37,20 +43,28 @@ public class RequestExecutor {
     private static final List<String> ALL_TLS = List.of("TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3");
 
     private final TokenCacheService tokenCacheService;
+    private final DomainTlsRegistry domainTlsRegistry;
 
-    public RequestExecutor(TokenCacheService tokenCacheService) {
+    public RequestExecutor(TokenCacheService tokenCacheService, DomainTlsRegistry domainTlsRegistry) {
         this.tokenCacheService = tokenCacheService;
+        this.domainTlsRegistry = domainTlsRegistry;
     }
 
     public Mono<ProxyResponse> execute(ApiRequest request, Environment environment, RequestSettings settings) {
         RequestSettings s = settings != null ? settings : RequestSettings.defaults();
         Instant start = Instant.now();
         String resolvedUrl = resolveVars(request.url(), environment.variables());
-        log.debug("Executing {} {} with settings httpVersion={} sslVerification={} followRedirects={}",
+
+        // Resolve server-side TLS config by target hostname — nothing from the caller
+        String targetHost = extractHost(resolvedUrl);
+        Optional<DomainEntry> domainTls = domainTlsRegistry.lookup(targetHost);
+        domainTls.ifPresent(e -> log.debug("Domain TLS match: {} → mTLS={} customCA={}", targetHost, e.hasMtls(), e.hasCustomCa()));
+
+        log.debug("Executing {} {} httpVersion={} sslVerification={} followRedirects={}",
                 request.method(), resolvedUrl, s.httpVersion(), s.sslVerification(), s.followRedirects());
 
         WebClient webClient = WebClient.builder()
-                .clientConnector(new ReactorClientHttpConnector(buildHttpClient(s, environment.tlsConfig())))
+                .clientConnector(new ReactorClientHttpConnector(buildHttpClient(s, domainTls.orElse(null))))
                 .build();
 
         Mono<String> tokenMono = needsOAuthToken(request)
@@ -93,69 +107,86 @@ public class RequestExecutor {
         });
     }
 
-    private HttpClient buildHttpClient(RequestSettings s, TlsConfig tls) {
+    private HttpClient buildHttpClient(RequestSettings s, DomainEntry tls) {
         HttpClient client = HttpClient.create();
 
-        // SSL — trust all certs when sslVerification is off, configure protocols and ciphers
         try {
             SslContextBuilder ssl = SslContextBuilder.forClient();
 
-            // mTLS — client certificate
-            if (tls != null && tls.clientCertPath() != null && !tls.clientCertPath().isBlank()) {
+            // mTLS — server-side only, resolved from DomainTlsRegistry
+            if (tls != null && tls.hasMtls()) {
                 String pwd = tls.clientKeyPassword();
-                if ("PKCS12".equalsIgnoreCase(tls.format())) {
-                    // PKCS12: cert + key in a single keystore file
+                char[] pwdChars = (pwd != null && !pwd.isBlank()) ? pwd.toCharArray() : new char[0];
+                if ("PKCS12".equalsIgnoreCase(tls.formatOrDefault())) {
                     KeyStore ks = KeyStore.getInstance("PKCS12");
-                    char[] pwdChars = (pwd != null && !pwd.isBlank()) ? pwd.toCharArray() : new char[0];
-                    try (FileInputStream fis = new FileInputStream(tls.clientCertPath())) {
-                        ks.load(fis, pwdChars);
+                    if (tls.kindOrDefault() == Kind.BASE64) {
+                        byte[] bytes = Base64.getDecoder().decode(tls.clientCertBase64().strip());
+                        try (var is = new ByteArrayInputStream(bytes)) { ks.load(is, pwdChars); }
+                        log.debug("mTLS (PKCS12/base64): {}", tls.hostname());
+                    } else {
+                        try (FileInputStream fis = new FileInputStream(tls.clientCertPath())) { ks.load(fis, pwdChars); }
+                        log.debug("mTLS (PKCS12/file): {}", tls.clientCertPath());
                     }
                     KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
                     kmf.init(ks, pwdChars);
                     ssl.keyManager(kmf);
                 } else {
-                    // PEM: separate cert and key files — Netty loads these natively
-                    File certFile = new File(tls.clientCertPath());
-                    File keyFile  = new File(tls.clientKeyPath());
-                    ssl.keyManager(certFile, keyFile, (pwd != null && !pwd.isBlank()) ? pwd : null);
+                    // PEM
+                    String keyPwd = (pwd != null && !pwd.isBlank()) ? pwd : null;
+                    if (tls.kindOrDefault() == Kind.BASE64) {
+                        byte[] certBytes = Base64.getDecoder().decode(tls.clientCertBase64().strip());
+                        byte[] keyBytes  = Base64.getDecoder().decode(tls.clientKeyBase64().strip());
+                        ssl.keyManager(new ByteArrayInputStream(certBytes), new ByteArrayInputStream(keyBytes), keyPwd);
+                        log.debug("mTLS (PEM/base64): {}", tls.hostname());
+                    } else {
+                        ssl.keyManager(new File(tls.clientCertPath()), new File(tls.clientKeyPath()), keyPwd);
+                        log.debug("mTLS (PEM/file): {}", tls.clientCertPath());
+                    }
                 }
-                log.debug("mTLS enabled: cert={}", tls.clientCertPath());
             }
 
-            // Custom CA — add to trust anchors in addition to system trust store
-            if (tls != null && tls.caCertPath() != null && !tls.caCertPath().isBlank()) {
-                ssl.trustManager(new File(tls.caCertPath()));
-                log.debug("Custom CA: {}", tls.caCertPath());
+            // Custom CA — server-side only, resolved from DomainTlsRegistry
+            if (tls != null && tls.hasCustomCa()) {
+                if (tls.kindOrDefault() == Kind.BASE64) {
+                    byte[] caBytes = Base64.getDecoder().decode(tls.caCertBase64().strip());
+                    ssl.trustManager(new ByteArrayInputStream(caBytes));
+                    log.debug("Custom CA (base64): {}", tls.hostname());
+                } else {
+                    ssl.trustManager(new File(tls.caCertPath()));
+                    log.debug("Custom CA (file): {}", tls.caCertPath());
+                }
             }
 
+            // Per-request SSL verification override (e.g. dev against self-signed without a custom CA)
             if (!s.sslVerification()) {
                 ssl.trustManager(InsecureTrustManagerFactory.INSTANCE);
             }
+
             if (s.disabledTlsProtocols() != null && !s.disabledTlsProtocols().isEmpty()) {
                 String[] enabled = ALL_TLS.stream()
                         .filter(p -> !s.disabledTlsProtocols().contains(p))
                         .toArray(String[]::new);
                 if (enabled.length > 0) ssl.protocols(enabled);
             }
+
             if (s.cipherSuites() != null && !s.cipherSuites().isBlank()) {
                 List<String> ciphers = Arrays.stream(s.cipherSuites().split("[,\\s]+"))
                         .map(String::trim).filter(c -> !c.isEmpty()).toList();
                 if (!ciphers.isEmpty()) ssl.ciphers(ciphers);
             }
+
             var sslCtx = ssl.build();
             client = client.secure(spec -> spec.sslContext(sslCtx));
         } catch (Exception e) {
             log.warn("SSL context configuration failed, falling back to default: {}", e.getMessage());
         }
 
-        // HTTP version
         client = switch (s.httpVersion() != null ? s.httpVersion() : "auto") {
             case "1.1" -> client.protocol(HttpProtocol.HTTP11);
             case "2"   -> client.protocol(HttpProtocol.H2, HttpProtocol.HTTP11);
             default    -> client;
         };
 
-        // Redirects — strip auth/referer headers on redirect if configured
         if (s.followRedirects()) {
             client = client.followRedirect(true, req -> {
                 if (!s.followAuthHeader()) req.requestHeaders().remove(HttpHeaders.AUTHORIZATION);
@@ -165,7 +196,6 @@ public class RequestExecutor {
             client = client.followRedirect(false);
         }
 
-        // Strict HTTP response header parsing
         client = client.httpResponseDecoder(spec -> spec.validateHeaders(s.strictHttpParser()));
 
         return client;
@@ -183,5 +213,13 @@ public class RequestExecutor {
             result = result.replace("{{" + entry.getKey() + "}}", entry.getValue());
         }
         return result;
+    }
+
+    private String extractHost(String url) {
+        try {
+            return URI.create(url).getHost();
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

@@ -13,6 +13,47 @@ kbootar:
     key: ${KBOOTAR_ENCRYPTION_KEY}
   workspace:
     dir: ${user.home}/.kbootar/workspaces/default
+  tls:
+    # Per-domain TLS configuration — resolved server-side, never sent over the wire.
+    # Matching: exact hostname first, then wildcard (*.example.com), in declaration order.
+    #
+    # kind: FILE (default) — cert/key/CA loaded from proxy-host filesystem paths
+    # kind: BASE64         — cert/key/CA supplied as base64-encoded content
+    #                        (use env-var refs so secrets never land in plain YAML)
+    #
+    # --- FILE examples ---
+    #
+    # domains:
+    #   - hostname: "api.internal.example.com"
+    #     kind: FILE
+    #     format: PKCS12
+    #     client-cert-path: /run/secrets/mtls/client.p12
+    #     client-key-password: ${INTERNAL_CERT_PASSWORD}
+    #     ca-cert-path: /run/secrets/ca/internal-ca.pem
+    #
+    #   - hostname: "*.staging.example.com"
+    #     kind: FILE
+    #     format: PEM
+    #     client-cert-path: /run/secrets/mtls/staging/client.pem
+    #     client-key-path:  /run/secrets/mtls/staging/client.key
+    #     client-key-password: ${STAGING_KEY_PASSWORD}
+    #
+    # --- BASE64 examples (ideal for Docker secrets / Vault / env injection) ---
+    #
+    #   - hostname: "api.example.com"
+    #     kind: BASE64
+    #     format: PEM
+    #     client-cert-base64: ${CLIENT_CERT_B64}
+    #     client-key-base64:  ${CLIENT_KEY_B64}
+    #     client-key-password: ${KEY_PASSWORD}
+    #     ca-cert-base64: ${CA_CERT_B64}
+    #
+    #   - hostname: "pkcs12.example.com"
+    #     kind: BASE64
+    #     format: PKCS12
+    #     client-cert-base64: ${P12_B64}
+    #     client-key-password: ${P12_PASSWORD}
+    domains: []
 
 server:
   port: 8080
