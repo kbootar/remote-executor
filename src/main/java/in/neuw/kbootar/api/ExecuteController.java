@@ -22,7 +22,6 @@ class ExecuteController {
     Mono<ProxyResponse> execute(@RequestBody ExecuteRequest executeRequest) {
         return requestExecutor.execute(
                 executeRequest.request(),
-                executeRequest.environment(),
                 executeRequest.settings());
     }
 }

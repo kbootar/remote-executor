@@ -5,10 +5,11 @@ info:
   description: |
     Backend proxy API for kbootar.
 
-    The proxy resolves `{{variable}}` placeholders in the URL, headers, and body,
-    manages the OAuth2 token lifecycle (client credentials), selects per-domain
-    mTLS configuration server-side, and executes the outbound HTTP request via
-    WebClient. Credentials never leave the server.
+    Variable substitution, auth token management, and environment resolution
+    happen on the client (app) side before the request reaches the proxy.
+    The proxy receives a fully resolved HTTP request, applies server-side
+    mTLS/CA configuration where configured, executes the outbound call via
+    WebClient, and returns the response.
   version: 0.1.0
   contact:
     name: Karanbir Singh
@@ -31,20 +32,13 @@ paths:
       tags: [Execute]
       summary: Execute an HTTP request
       description: |
-        Resolves `{{variable}}` placeholders, attaches auth, and proxies the
-        request to the target URL. The `status` field in the response reflects
-        the target API's HTTP status code, not the proxy call itself.
+        Executes a fully resolved HTTP request. The proxy:
+        1. Looks up the target hostname in `DomainTlsRegistry` for per-domain mTLS/CA config (server-side only — not accepted from callers)
+        2. Builds a `WebClient` with the given `RequestSettings`
+        3. Sends the request and streams the response back
 
-        **Auth strategies**
-        | `authConfig.type` | Behaviour |
-        |---|---|
-        | `NONE` | No auth header added |
-        | `BEARER_TOKEN` | Bearer token resolved from a `{{variable}}` already in `headers` |
-        | `OAUTH2_CLIENT_CREDENTIALS` | Token fetched (and cached) using `environment.oauthConfig` |
-        | `MTLS` | Client certificate selected via per-domain TLS registry (server config only) |
-
-        TLS configuration is **not** accepted from callers — it is resolved server-side
-        via `DomainTlsRegistry` based on the target hostname.
+        All `{{variable}}` substitution and auth token attachment are done by the
+        calling app before this endpoint is invoked.
       operationId: execute
       requestBody:
         required: true
@@ -57,18 +51,9 @@ paths:
                 summary: GET with no auth
                 value:
                   request:
-                    id: req-001
-                    name: Get Health
                     method: GET
-                    url: "{{baseUrl}}/actuator/health"
+                    url: "https://api.example.com/actuator/health"
                     headers: {}
-                    authConfig:
-                      type: NONE
-                  environment:
-                    id: env-local
-                    name: Local
-                    variables:
-                      baseUrl: "https://api.example.com"
                   settings:
                     httpVersion: auto
                     sslVerification: false
@@ -83,29 +68,16 @@ paths:
                     maxRedirects: 10
                     disabledTlsProtocols: []
                     cipherSuites: ""
-              oauth2_post:
-                summary: POST with OAuth2 client credentials
+              bearer_post:
+                summary: POST with Bearer token (attached by the app)
                 value:
                   request:
-                    id: req-002
-                    name: Create Pet
                     method: POST
-                    url: "{{baseUrl}}/pet"
+                    url: "https://api.example.com/pet"
                     headers:
                       Content-Type: application/json
+                      Authorization: "Bearer eyJhbGciOiJSUzI1NiJ9..."
                     body: '{"name":"doggie","status":"available"}'
-                    authConfig:
-                      type: OAUTH2_CLIENT_CREDENTIALS
-                  environment:
-                    id: env-prod
-                    name: Production
-                    variables:
-                      baseUrl: "https://petstore3.swagger.io/api/v3"
-                    oauthConfig:
-                      tokenUri: "https://auth.example.com/oauth2/token"
-                      encryptedClientId: "enc:abc123..."
-                      encryptedClientSecret: "enc:xyz789..."
-                      scope: "api:write"
                   settings:
                     httpVersion: auto
                     sslVerification: false
@@ -132,19 +104,18 @@ paths:
         '400':
           description: Invalid request payload
         '500':
-          description: Proxy error (network failure, token fetch failure, etc.)
+          description: Proxy error (network failure, SSL context build failure, etc.)
 
   /mock:
     get:
       tags: [Mock]
-      summary: Echo at root path
       operationId: mockRootGet
+      summary: Echo GET at /mock
       responses:
         '200':
           $ref: '#/components/responses/MockResponse'
     post:
       tags: [Mock]
-      summary: Echo POST at root path
       operationId: mockRootPost
       requestBody:
         required: false
@@ -198,7 +169,6 @@ paths:
           $ref: '#/components/responses/MockResponse'
     post:
       tags: [Mock]
-      summary: Echo POST
       operationId: mockPost
       requestBody:
         required: false
@@ -211,7 +181,6 @@ paths:
           $ref: '#/components/responses/MockResponse'
     put:
       tags: [Mock]
-      summary: Echo PUT
       operationId: mockPut
       requestBody:
         required: false
@@ -224,14 +193,12 @@ paths:
           $ref: '#/components/responses/MockResponse'
     delete:
       tags: [Mock]
-      summary: Echo DELETE
       operationId: mockDelete
       responses:
         '200':
           $ref: '#/components/responses/MockResponse'
     patch:
       tags: [Mock]
-      summary: Echo PATCH
       operationId: mockPatch
       requestBody:
         required: false
@@ -254,7 +221,7 @@ components:
         type: string
       description: |
         Any path segment(s) below `/mock/`. Multi-segment paths (e.g. `/mock/a/b/c`)
-        are matched by the Spring `/**` wildcard and all echoed back verbatim.
+        are matched by the Spring `/**` wildcard and echoed back verbatim.
 
   responses:
     MockResponse:
@@ -268,12 +235,10 @@ components:
 
     ExecuteRequest:
       type: object
-      required: [request, environment, settings]
+      required: [request, settings]
       properties:
         request:
           $ref: '#/components/schemas/ApiRequest'
-        environment:
-          $ref: '#/components/schemas/Environment'
         settings:
           $ref: '#/components/schemas/RequestSettings'
 
@@ -281,89 +246,27 @@ components:
       type: object
       required: [method, url]
       properties:
-        id:
-          type: string
-          description: Opaque request identifier (used for logging/history by the caller)
-        collectionId:
-          type: string
-        name:
-          type: string
         method:
           type: string
           enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
         url:
           type: string
-          description: Target URL. May contain `{{variable}}` placeholders resolved from `environment.variables`.
-          example: "{{baseUrl}}/api/v1/users"
+          description: Fully resolved target URL — no `{{variable}}` placeholders.
+          example: "https://api.example.com/v1/users"
         headers:
           type: object
           additionalProperties:
             type: string
+          description: |
+            HTTP headers to send. Auth headers (Bearer, Basic, etc.) should be
+            attached here by the app before calling the proxy.
+          example:
+            Authorization: "Bearer eyJhbGciOiJSUzI1NiJ9..."
+            Content-Type: "application/json"
         body:
           type: string
           nullable: true
           description: Raw request body string.
-        authConfig:
-          $ref: '#/components/schemas/AuthConfig'
-
-    AuthConfig:
-      type: object
-      required: [type]
-      properties:
-        type:
-          $ref: '#/components/schemas/AuthType'
-
-    AuthType:
-      type: string
-      enum: [NONE, BEARER_TOKEN, OAUTH2_CLIENT_CREDENTIALS, MTLS]
-      description: |
-        - `NONE` — no auth
-        - `BEARER_TOKEN` — Bearer token already in `headers` via `{{variable}}` substitution
-        - `OAUTH2_CLIENT_CREDENTIALS` — token fetched and cached using `environment.oauthConfig`
-        - `MTLS` — client cert selected server-side via `DomainTlsRegistry`
-
-    Environment:
-      type: object
-      required: [id, name]
-      properties:
-        id:
-          type: string
-          example: env-prod
-        name:
-          type: string
-          example: Production
-        variables:
-          type: object
-          additionalProperties:
-            type: string
-          description: Key-value pairs. Values are substituted for `{{key}}` placeholders in the request.
-          example:
-            baseUrl: "https://api.example.com"
-        oauthConfig:
-          $ref: '#/components/schemas/OAuthConfig'
-          description: Required when `authConfig.type` is `OAUTH2_CLIENT_CREDENTIALS`; omit otherwise.
-          nullable: true
-
-    OAuthConfig:
-      type: object
-      required: [tokenUri, encryptedClientId, encryptedClientSecret]
-      properties:
-        tokenUri:
-          type: string
-          format: uri
-          example: "https://auth.example.com/oauth2/token"
-        encryptedClientId:
-          type: string
-          description: AES-GCM encrypted value, prefixed with `enc:`. Decrypted server-side by `CredentialVault`.
-          example: "enc:abc123..."
-        encryptedClientSecret:
-          type: string
-          description: AES-GCM encrypted value, prefixed with `enc:`.
-          example: "enc:xyz789..."
-        scope:
-          type: string
-          nullable: true
-          example: "api:read api:write"
 
     RequestSettings:
       type: object
@@ -400,7 +303,7 @@ components:
         encodeUrl:
           type: boolean
           default: true
-          description: Percent-encode the resolved URL before sending.
+          description: Percent-encode the URL before sending.
         disableCookieJar:
           type: boolean
           default: false
@@ -434,7 +337,7 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Response headers from the target (collapsed to single string per header name).
+          description: Response headers from the target (collapsed to single string per name).
         setCookies:
           type: array
           items:
@@ -443,16 +346,15 @@ components:
         body:
           type: string
           nullable: true
-          description: Response body as a string.
         durationMs:
           type: integer
           format: int64
           description: End-to-end proxy duration in milliseconds.
           example: 142
-        resolvedUrl:
+        url:
           type: string
-          description: The actual URL sent to the target after `{{variable}}` substitution.
-          example: "https://api.example.com/actuator/health"
+          description: The URL that was sent to the target.
+          example: "https://api.example.com/v1/users"
 
     MockEchoResponse:
       type: object
@@ -470,16 +372,14 @@ components:
             type: array
             items:
               type: string
-          description: Multi-value query parameters map.
         headers:
           type: object
           additionalProperties:
             type: string
           description: Request headers (multi-value joined with `, `).
         body:
-          description: Raw request body string, or `null` if the request had no body.
+          description: Raw request body string, or `null` if no body.
           nullable: true
         _kbootar:
           type: string
           enum: [mock]
-          description: Sentinel field — always `"mock"` to identify echo responses.

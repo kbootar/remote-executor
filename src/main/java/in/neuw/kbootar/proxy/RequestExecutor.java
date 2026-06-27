@@ -1,9 +1,6 @@
 package in.neuw.kbootar.proxy;
 
-import in.neuw.kbootar.auth.TokenCacheService;
 import in.neuw.kbootar.collection.ApiRequest;
-import in.neuw.kbootar.collection.AuthType;
-import in.neuw.kbootar.collection.Environment;
 import in.neuw.kbootar.tls.DomainTlsProperties.DomainEntry;
 import in.neuw.kbootar.tls.DomainTlsProperties.Kind;
 import in.neuw.kbootar.tls.DomainTlsRegistry;
@@ -26,14 +23,13 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.net.URI;
 import java.security.KeyStore;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.time.Duration;
-import java.time.Instant;
 
 @Service
 public class RequestExecutor {
@@ -42,68 +38,53 @@ public class RequestExecutor {
 
     private static final List<String> ALL_TLS = List.of("TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3");
 
-    private final TokenCacheService tokenCacheService;
     private final DomainTlsRegistry domainTlsRegistry;
 
-    public RequestExecutor(TokenCacheService tokenCacheService, DomainTlsRegistry domainTlsRegistry) {
-        this.tokenCacheService = tokenCacheService;
+    public RequestExecutor(DomainTlsRegistry domainTlsRegistry) {
         this.domainTlsRegistry = domainTlsRegistry;
     }
 
-    public Mono<ProxyResponse> execute(ApiRequest request, Environment environment, RequestSettings settings) {
+    public Mono<ProxyResponse> execute(ApiRequest request, RequestSettings settings) {
         RequestSettings s = settings != null ? settings : RequestSettings.defaults();
         Instant start = Instant.now();
-        String resolvedUrl = resolveVars(request.url(), environment.variables());
 
-        // Resolve server-side TLS config by target hostname — nothing from the caller
-        String targetHost = extractHost(resolvedUrl);
+        String targetHost = extractHost(request.url());
         Optional<DomainEntry> domainTls = domainTlsRegistry.lookup(targetHost);
         domainTls.ifPresent(e -> log.debug("Domain TLS match: {} → mTLS={} customCA={}", targetHost, e.hasMtls(), e.hasCustomCa()));
 
         log.debug("Executing {} {} httpVersion={} sslVerification={} followRedirects={}",
-                request.method(), resolvedUrl, s.httpVersion(), s.sslVerification(), s.followRedirects());
+                request.method(), request.url(), s.httpVersion(), s.sslVerification(), s.followRedirects());
 
         WebClient webClient = WebClient.builder()
                 .clientConnector(new ReactorClientHttpConnector(buildHttpClient(s, domainTls.orElse(null))))
                 .build();
 
-        Mono<String> tokenMono = needsOAuthToken(request)
-                ? tokenCacheService.getToken(environment.id(), environment)
-                : Mono.just("");
+        WebClient.RequestBodySpec requestSpec = webClient
+                .method(HttpMethod.valueOf(request.method().toUpperCase()))
+                .uri(request.url());
 
-        return tokenMono.flatMap(token -> {
-            WebClient.RequestBodySpec requestSpec = webClient
-                    .method(HttpMethod.valueOf(request.method().toUpperCase()))
-                    .uri(resolvedUrl);
+        if (request.headers() != null) {
+            request.headers().forEach(requestSpec::header);
+        }
 
-            if (request.headers() != null) {
-                request.headers().forEach((k, v) ->
-                        requestSpec.header(k, resolveVars(v, environment.variables())));
-            }
+        WebClient.RequestHeadersSpec<?> spec =
+                (request.body() != null && !request.body().isBlank())
+                        ? requestSpec.bodyValue(request.body())
+                        : requestSpec;
 
-            if (!token.isBlank()) {
-                requestSpec.header("Authorization", "Bearer " + token);
-            }
-
-            WebClient.RequestHeadersSpec<?> spec =
-                    (request.body() != null && !request.body().isBlank())
-                            ? requestSpec.bodyValue(resolveVars(request.body(), environment.variables()))
-                            : requestSpec;
-
-            return spec.exchangeToMono(response -> {
-                long durationMs = Duration.between(start, Instant.now()).toMillis();
-                List<String> setCookies = Objects.requireNonNullElse(
-                        response.headers().asHttpHeaders().get(HttpHeaders.SET_COOKIE), List.of());
-                return response.bodyToMono(String.class)
-                        .defaultIfEmpty("")
-                        .map(body -> new ProxyResponse(
-                                response.statusCode().value(),
-                                response.headers().asHttpHeaders().toSingleValueMap(),
-                                setCookies,
-                                body,
-                                durationMs,
-                                resolvedUrl));
-            });
+        return spec.exchangeToMono(response -> {
+            long durationMs = Duration.between(start, Instant.now()).toMillis();
+            List<String> setCookies = Objects.requireNonNullElse(
+                    response.headers().asHttpHeaders().get(HttpHeaders.SET_COOKIE), List.of());
+            return response.bodyToMono(String.class)
+                    .defaultIfEmpty("")
+                    .map(body -> new ProxyResponse(
+                            response.statusCode().value(),
+                            response.headers().asHttpHeaders().toSingleValueMap(),
+                            setCookies,
+                            body,
+                            durationMs,
+                            request.url()));
         });
     }
 
@@ -113,7 +94,6 @@ public class RequestExecutor {
         try {
             SslContextBuilder ssl = SslContextBuilder.forClient();
 
-            // mTLS — server-side only, resolved from DomainTlsRegistry
             if (tls != null && tls.hasMtls()) {
                 String pwd = tls.clientKeyPassword();
                 char[] pwdChars = (pwd != null && !pwd.isBlank()) ? pwd.toCharArray() : new char[0];
@@ -131,7 +111,6 @@ public class RequestExecutor {
                     kmf.init(ks, pwdChars);
                     ssl.keyManager(kmf);
                 } else {
-                    // PEM
                     String keyPwd = (pwd != null && !pwd.isBlank()) ? pwd : null;
                     if (tls.kindOrDefault() == Kind.BASE64) {
                         byte[] certBytes = Base64.getDecoder().decode(tls.clientCertBase64().strip());
@@ -145,7 +124,6 @@ public class RequestExecutor {
                 }
             }
 
-            // Custom CA — server-side only, resolved from DomainTlsRegistry
             if (tls != null && tls.hasCustomCa()) {
                 if (tls.kindOrDefault() == Kind.BASE64) {
                     byte[] caBytes = Base64.getDecoder().decode(tls.caCertBase64().strip());
@@ -157,7 +135,6 @@ public class RequestExecutor {
                 }
             }
 
-            // Per-request SSL verification override (e.g. dev against self-signed without a custom CA)
             if (!s.sslVerification()) {
                 ssl.trustManager(InsecureTrustManagerFactory.INSTANCE);
             }
@@ -199,20 +176,6 @@ public class RequestExecutor {
         client = client.httpResponseDecoder(spec -> spec.validateHeaders(s.strictHttpParser()));
 
         return client;
-    }
-
-    private boolean needsOAuthToken(ApiRequest request) {
-        return request.authConfig() != null
-                && request.authConfig().type() == AuthType.OAUTH2_CLIENT_CREDENTIALS;
-    }
-
-    private String resolveVars(String template, Map<String, String> variables) {
-        if (template == null || variables == null || variables.isEmpty()) return template;
-        String result = template;
-        for (var entry : variables.entrySet()) {
-            result = result.replace("{{" + entry.getKey() + "}}", entry.getValue());
-        }
-        return result;
     }
 
     private String extractHost(String url) {
