@@ -91,10 +91,12 @@ public class RequestExecutor {
     private HttpClient buildHttpClient(RequestSettings s, DomainEntry tls) {
         HttpClient client = HttpClient.create();
 
-        try {
-            SslContextBuilder ssl = SslContextBuilder.forClient();
+        SslContextBuilder ssl = SslContextBuilder.forClient();
 
-            if (tls != null && tls.hasMtls()) {
+        // mTLS client cert — server-side only, from DomainTlsRegistry.
+        // Wrapped individually so a bad keystore doesn't prevent sslVerification from applying.
+        if (tls != null && tls.hasMtls()) {
+            try {
                 String pwd = tls.clientKeyPassword();
                 char[] pwdChars = (pwd != null && !pwd.isBlank()) ? pwd.toCharArray() : new char[0];
                 if ("PKCS12".equalsIgnoreCase(tls.formatOrDefault())) {
@@ -122,9 +124,14 @@ public class RequestExecutor {
                         log.debug("mTLS (PEM/file): {}", tls.clientCertPath());
                     }
                 }
+            } catch (Exception e) {
+                log.warn("mTLS setup failed for {}: {}", tls.hostname(), e.getMessage());
             }
+        }
 
-            if (tls != null && tls.hasCustomCa()) {
+        // Custom CA — server-side only, from DomainTlsRegistry
+        if (tls != null && tls.hasCustomCa()) {
+            try {
                 if (tls.kindOrDefault() == Kind.BASE64) {
                     byte[] caBytes = Base64.getDecoder().decode(tls.caCertBase64().strip());
                     ssl.trustManager(new ByteArrayInputStream(caBytes));
@@ -133,29 +140,34 @@ public class RequestExecutor {
                     ssl.trustManager(new File(tls.caCertPath()));
                     log.debug("Custom CA (file): {}", tls.caCertPath());
                 }
+            } catch (Exception e) {
+                log.warn("Custom CA setup failed for {}: {}", tls.hostname(), e.getMessage());
             }
+        }
 
-            if (!s.sslVerification()) {
-                ssl.trustManager(InsecureTrustManagerFactory.INSTANCE);
-            }
+        // sslVerification is always applied last so it overrides any CA config above
+        if (!s.sslVerification()) {
+            ssl.trustManager(InsecureTrustManagerFactory.INSTANCE);
+        }
 
-            if (s.disabledTlsProtocols() != null && !s.disabledTlsProtocols().isEmpty()) {
-                String[] enabled = ALL_TLS.stream()
-                        .filter(p -> !s.disabledTlsProtocols().contains(p))
-                        .toArray(String[]::new);
-                if (enabled.length > 0) ssl.protocols(enabled);
-            }
+        if (s.disabledTlsProtocols() != null && !s.disabledTlsProtocols().isEmpty()) {
+            String[] enabled = ALL_TLS.stream()
+                    .filter(p -> !s.disabledTlsProtocols().contains(p))
+                    .toArray(String[]::new);
+            if (enabled.length > 0) ssl.protocols(enabled);
+        }
 
-            if (s.cipherSuites() != null && !s.cipherSuites().isBlank()) {
-                List<String> ciphers = Arrays.stream(s.cipherSuites().split("[,\\s]+"))
-                        .map(String::trim).filter(c -> !c.isEmpty()).toList();
-                if (!ciphers.isEmpty()) ssl.ciphers(ciphers);
-            }
+        if (s.cipherSuites() != null && !s.cipherSuites().isBlank()) {
+            List<String> ciphers = Arrays.stream(s.cipherSuites().split("[,\\s]+"))
+                    .map(String::trim).filter(c -> !c.isEmpty()).toList();
+            if (!ciphers.isEmpty()) ssl.ciphers(ciphers);
+        }
 
+        try {
             var sslCtx = ssl.build();
             client = client.secure(spec -> spec.sslContext(sslCtx));
         } catch (Exception e) {
-            log.warn("SSL context configuration failed, falling back to default: {}", e.getMessage());
+            log.warn("SSL context build failed: {}", e.getMessage());
         }
 
         client = switch (s.httpVersion() != null ? s.httpVersion() : "auto") {

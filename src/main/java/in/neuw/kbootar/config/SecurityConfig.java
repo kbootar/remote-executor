@@ -28,7 +28,10 @@ public class SecurityConfig {
         // Allow any localhost origin; Traefik tightens this in production (Phase 4)
         config.addAllowedOriginPattern("http://localhost:*");
         config.addAllowedOriginPattern("http://127.0.0.1:*");
-        // Krema desktop WebView loads from file://, which browsers report as Origin: null
+        // Tauri WKWebView on macOS
+        config.addAllowedOrigin("tauri://localhost");
+        config.addAllowedOriginPattern("https://tauri.localhost");
+        // Krema/file:// WebViews report Origin: null
         config.addAllowedOrigin("null");
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"));
         config.setAllowedHeaders(List.of("*"));
