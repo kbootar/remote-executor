@@ -11,8 +11,6 @@ kbootar:
   encryption:
     # Generate a key: export KBOOTAR_ENCRYPTION_KEY=$(openssl rand -base64 32)
     key: ${KBOOTAR_ENCRYPTION_KEY}
-  workspace:
-    dir: ${user.home}/.kbootar/workspaces/default
   tls:
     # Per-domain TLS configuration — resolved server-side, never sent over the wire.
     # Matching: exact hostname first, then wildcard (*.example.com), in declaration order.
