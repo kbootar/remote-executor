@@ -9,5 +9,6 @@ public record ProxyResponse(
         List<String> setCookies,
         String body,
         long durationMs,
-        String resolvedUrl
+        String resolvedUrl,
+        String httpVersion
 ) {}

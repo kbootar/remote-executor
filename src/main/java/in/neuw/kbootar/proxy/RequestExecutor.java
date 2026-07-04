@@ -99,7 +99,12 @@ public class RequestExecutor {
                             setCookies,
                             body,
                             durationMs,
-                            request.url()));
+                            request.url(),
+                            switch (s.httpVersion() != null ? s.httpVersion() : "auto") {
+                                case "2"   -> "HTTP/2.0";
+                                case "1.1" -> "HTTP/1.1";
+                                default    -> "HTTP/1.1";
+                            }));
         });
     }
 
