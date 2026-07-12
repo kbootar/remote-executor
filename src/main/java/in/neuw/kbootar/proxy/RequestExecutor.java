@@ -1,6 +1,7 @@
 package in.neuw.kbootar.proxy;
 
 import in.neuw.kbootar.collection.ApiRequest;
+import in.neuw.kbootar.collection.MultipartPart;
 import in.neuw.kbootar.tls.DomainTlsProperties.DomainEntry;
 import in.neuw.kbootar.tls.DomainTlsProperties.Kind;
 import in.neuw.kbootar.tls.DomainTlsRegistry;
@@ -8,10 +9,15 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.stereotype.Service;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.HttpProtocol;
@@ -82,10 +88,7 @@ public class RequestExecutor {
             request.headers().forEach(requestSpec::header);
         }
 
-        WebClient.RequestHeadersSpec<?> spec =
-                (request.body() != null && !request.body().isBlank())
-                        ? requestSpec.bodyValue(request.body())
-                        : requestSpec;
+        WebClient.RequestHeadersSpec<?> spec = buildBody(requestSpec, request);
 
         return spec.exchangeToMono(response -> {
             long durationMs = Duration.between(start, Instant.now()).toMillis();
@@ -106,6 +109,52 @@ public class RequestExecutor {
                                 default    -> "HTTP/1.1";
                             }));
         });
+    }
+
+    private WebClient.RequestHeadersSpec<?> buildBody(WebClient.RequestBodySpec requestSpec, ApiRequest request) {
+        // Multipart/form-data
+        if (request.multipartBody() != null && !request.multipartBody().isEmpty()) {
+            MultiValueMap<String, Object> parts = new LinkedMultiValueMap<>();
+            for (MultipartPart part : request.multipartBody()) {
+                if ("file".equals(part.type()) && part.base64() != null) {
+                    byte[] bytes = Base64.getDecoder().decode(part.base64());
+                    String mime = part.mimeType() != null && !part.mimeType().isBlank()
+                            ? part.mimeType() : "application/octet-stream";
+                    String filename = part.fileName() != null && !part.fileName().isBlank()
+                            ? part.fileName() : part.name();
+                    ByteArrayResource resource = new ByteArrayResource(bytes) {
+                        @Override public String getFilename() { return filename; }
+                    };
+                    org.springframework.http.HttpEntity<ByteArrayResource> entity =
+                            new org.springframework.http.HttpEntity<>(resource,
+                                    buildPartHeaders(mime, filename));
+                    parts.add(part.name(), entity);
+                } else {
+                    parts.add(part.name(), part.value() != null ? part.value() : "");
+                }
+            }
+            return requestSpec.body(BodyInserters.fromMultipartData(parts));
+        }
+
+        // Binary — base64-encoded body
+        if ("base64".equals(request.bodyEncoding()) && request.body() != null) {
+            byte[] bytes = Base64.getDecoder().decode(request.body());
+            return requestSpec.bodyValue(bytes);
+        }
+
+        // Text body (JSON, plain text, URL-encoded)
+        if (request.body() != null && !request.body().isBlank()) {
+            return requestSpec.bodyValue(request.body());
+        }
+
+        return requestSpec;
+    }
+
+    private HttpHeaders buildPartHeaders(String mimeType, String filename) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.parseMediaType(mimeType));
+        headers.setContentDispositionFormData("form-data", filename);
+        return headers;
     }
 
     private HttpClient buildHttpClient(RequestSettings s, DomainEntry tls) {
