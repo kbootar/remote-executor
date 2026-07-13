@@ -80,9 +80,15 @@ public class RequestExecutor {
                 .clientConnector(new ReactorClientHttpConnector(buildHttpClient(s, domainTls.orElse(null))))
                 .build();
 
+        // .uri(URI), not .uri(String): the URL arriving here (from kbootar's client) is
+        // already percent-encoded. WebClient's default UriBuilderFactory treats a String as
+        // a template and re-encodes it — including the "%" in existing "%XX" escapes — which
+        // double-encodes the URL (e.g. "%3D" becomes "%253D" on the wire). Passing a URI object
+        // bypasses that template-encoding pass entirely, since Spring assumes URI objects are
+        // already well-formed.
         WebClient.RequestBodySpec requestSpec = webClient
                 .method(HttpMethod.valueOf(request.method().toUpperCase()))
-                .uri(request.url());
+                .uri(URI.create(request.url()));
 
         if (request.headers() != null) {
             request.headers().forEach(requestSpec::header);
