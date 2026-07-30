@@ -56,7 +56,7 @@ paths:
                     headers: {}
                   settings:
                     httpVersion: auto
-                    sslVerification: false
+                    sslVerification: true
                     followRedirects: true
                     followOriginalMethod: false
                     followAuthHeader: false
@@ -80,7 +80,7 @@ paths:
                     body: '{"name":"doggie","status":"available"}'
                   settings:
                     httpVersion: auto
-                    sslVerification: false
+                    sslVerification: true
                     followRedirects: true
                     followOriginalMethod: false
                     followAuthHeader: false
@@ -281,7 +281,7 @@ components:
           description: Force a specific HTTP version or let the client negotiate (`auto`).
         sslVerification:
           type: boolean
-          default: false
+          default: true
           description: Verify the server's TLS certificate. Set `true` for production targets.
         followRedirects:
           type: boolean
@@ -325,6 +325,10 @@ components:
           type: string
           default: ""
           description: Comma-separated cipher suite names. Empty string means server defaults.
+        acceptEncoding:
+          type: string
+          default: "gzip, br, deflate"
+          description: Comma-separated response compression codings. Empty disables automatic decompression.
 
     ProxyResponse:
       type: object

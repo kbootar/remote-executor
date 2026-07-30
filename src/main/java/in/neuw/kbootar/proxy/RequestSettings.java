@@ -15,13 +15,14 @@ public record RequestSettings(
         boolean serverCipherSuite,
         int maxRedirects,
         List<String> disabledTlsProtocols,
-        String cipherSuites
+        String cipherSuites,
+        String acceptEncoding
 ) {
     public static RequestSettings defaults() {
         return new RequestSettings(
-                "auto", false, true, false, false,
+                "auto", true, true, false, false,
                 false, false, true, false, false,
-                10, List.of(), ""
+                10, List.of(), "", "gzip, br, deflate"
         );
     }
 }

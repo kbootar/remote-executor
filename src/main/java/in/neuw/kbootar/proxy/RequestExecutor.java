@@ -13,11 +13,13 @@ import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.HttpProtocol;
@@ -31,12 +33,14 @@ import java.net.URI;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class RequestExecutor {
@@ -68,6 +72,7 @@ public class RequestExecutor {
     public Mono<ProxyResponse> execute(ApiRequest request, RequestSettings settings) {
         RequestSettings s = settings != null ? settings : RequestSettings.defaults();
         Instant start = Instant.now();
+        URI targetUri = URI.create(request.url());
 
         String targetHost = extractHost(request.url());
         Optional<DomainEntry> domainTls = domainTlsRegistry.lookup(targetHost);
@@ -76,45 +81,203 @@ public class RequestExecutor {
         log.debug("Executing {} {} httpVersion={} sslVerification={} followRedirects={}",
                 request.method(), request.url(), s.httpVersion(), s.sslVerification(), s.followRedirects());
 
-        WebClient webClient = WebClient.builder()
-                .clientConnector(new ReactorClientHttpConnector(buildHttpClient(s, domainTls.orElse(null))))
-                .build();
-
-        // .uri(URI), not .uri(String): the URL arriving here (from kbootar's client) is
-        // already percent-encoded. WebClient's default UriBuilderFactory treats a String as
-        // a template and re-encodes it — including the "%" in existing "%XX" escapes — which
-        // double-encodes the URL (e.g. "%3D" becomes "%253D" on the wire). Passing a URI object
-        // bypasses that template-encoding pass entirely, since Spring assumes URI objects are
-        // already well-formed.
-        WebClient.RequestBodySpec requestSpec = webClient
-                .method(HttpMethod.valueOf(request.method().toUpperCase()))
-                .uri(URI.create(request.url()));
-
-        if (request.headers() != null) {
-            request.headers().forEach(requestSpec::header);
+        final WebClient webClient;
+        AtomicReference<String> negotiatedHttpVersion = new AtomicReference<>("HTTP/1.1");
+        try {
+            HttpClient httpClient = buildHttpClient(s, domainTls.orElse(null), targetUri)
+                    .doOnResponse((response, connection) ->
+                            negotiatedHttpVersion.set(response.version().text()));
+            webClient = WebClient.builder()
+                    .clientConnector(new ReactorClientHttpConnector(httpClient))
+                    .build();
+        } catch (RuntimeException e) {
+            return Mono.error(e);
         }
 
-        WebClient.RequestHeadersSpec<?> spec = buildBody(requestSpec, request);
+        HttpHeaders headers = new HttpHeaders();
+        if (request.headers() != null) {
+            request.headers().forEach(headers::set);
+        }
+
+        return exchange(
+                webClient,
+                request,
+                s,
+                start,
+                targetUri,
+                HttpMethod.valueOf(request.method().toUpperCase()),
+                headers,
+                true,
+                0,
+                negotiatedHttpVersion);
+    }
+
+    private Mono<ProxyResponse> exchange(
+            WebClient webClient,
+            ApiRequest request,
+            RequestSettings settings,
+            Instant start,
+            URI uri,
+            HttpMethod method,
+            HttpHeaders headers,
+            boolean includeBody,
+            int redirectCount,
+            AtomicReference<String> negotiatedHttpVersion
+    ) {
+        // The URL arriving from kbootar is already encoded. URI avoids WebClient treating
+        // percent escapes as template input and encoding them a second time.
+        WebClient.RequestBodySpec requestSpec = webClient.method(method).uri(uri);
+        requestSpec.headers(outbound -> {
+            outbound.addAll(headers);
+            String acceptEncoding = normalizedAcceptEncoding(settings.acceptEncoding());
+            if (acceptEncoding.isBlank()) {
+                outbound.remove(HttpHeaders.ACCEPT_ENCODING);
+            } else {
+                outbound.set(HttpHeaders.ACCEPT_ENCODING, acceptEncoding);
+            }
+        });
+        WebClient.RequestHeadersSpec<?> spec = includeBody
+                ? buildBody(requestSpec, request)
+                : requestSpec;
 
         return spec.exchangeToMono(response -> {
-            long durationMs = Duration.between(start, Instant.now()).toMillis();
-            List<String> setCookies = Objects.requireNonNullElse(
-                    response.headers().asHttpHeaders().get(HttpHeaders.SET_COOKIE), List.of());
-            return response.bodyToMono(String.class)
-                    .defaultIfEmpty("")
-                    .map(body -> new ProxyResponse(
-                            response.statusCode().value(),
-                            response.headers().asHttpHeaders().toSingleValueMap(),
-                            setCookies,
-                            body,
-                            durationMs,
-                            request.url(),
-                            switch (s.httpVersion() != null ? s.httpVersion() : "auto") {
-                                case "2"   -> "HTTP/2.0";
-                                case "1.1" -> "HTTP/1.1";
-                                default    -> "HTTP/1.1";
-                            }));
+            if (settings.followRedirects() && isRedirect(response.statusCode())) {
+                String location = response.headers().asHttpHeaders().getFirst(HttpHeaders.LOCATION);
+                if (location == null || location.isBlank()) {
+                    return toProxyResponse(response, start, uri, negotiatedHttpVersion);
+                }
+                if (redirectCount >= Math.max(0, settings.maxRedirects())) {
+                    return response.releaseBody().then(Mono.error(new IllegalStateException(
+                            "Redirect limit (" + Math.max(0, settings.maxRedirects()) + ") exceeded")));
+                }
+
+                final URI destination;
+                try {
+                    destination = uri.resolve(URI.create(location));
+                } catch (IllegalArgumentException e) {
+                    return response.releaseBody().then(Mono.error(
+                            new IllegalArgumentException("Invalid redirect Location '" + location + "'", e)));
+                }
+
+                HttpMethod nextMethod = redirectedMethod(
+                        response.statusCode(), method, settings.followOriginalMethod());
+                boolean nextIncludesBody = includeBody && nextMethod == method;
+                HttpHeaders nextHeaders = copyHeaders(headers);
+                if (!nextIncludesBody) {
+                    nextHeaders.remove(HttpHeaders.CONTENT_LENGTH);
+                    nextHeaders.remove(HttpHeaders.CONTENT_TYPE);
+                    nextHeaders.remove(HttpHeaders.TRANSFER_ENCODING);
+                }
+                applyRedirectHeaders(nextHeaders, uri, destination, settings);
+
+                return response.releaseBody().then(exchange(
+                        webClient,
+                        request,
+                        settings,
+                        start,
+                        destination,
+                        nextMethod,
+                        nextHeaders,
+                        nextIncludesBody,
+                        redirectCount + 1,
+                        negotiatedHttpVersion));
+            }
+
+            return toProxyResponse(response, start, uri, negotiatedHttpVersion);
         });
+    }
+
+    private Mono<ProxyResponse> toProxyResponse(
+            ClientResponse response,
+            Instant start,
+            URI resolvedUri,
+            AtomicReference<String> negotiatedHttpVersion
+    ) {
+        long durationMs = Duration.between(start, Instant.now()).toMillis();
+        List<String> setCookies = Objects.requireNonNullElse(
+                response.headers().asHttpHeaders().get(HttpHeaders.SET_COOKIE), List.of());
+        return response.bodyToMono(String.class)
+                .defaultIfEmpty("")
+                .map(body -> new ProxyResponse(
+                        response.statusCode().value(),
+                        response.headers().asHttpHeaders().toSingleValueMap(),
+                        setCookies,
+                        body,
+                        durationMs,
+                        resolvedUri.toString(),
+                        negotiatedHttpVersion.get()));
+    }
+
+    private static HttpHeaders copyHeaders(HttpHeaders source) {
+        HttpHeaders copy = new HttpHeaders();
+        source.forEach((name, values) -> copy.put(name, new ArrayList<>(values)));
+        return copy;
+    }
+
+    private static boolean isRedirect(HttpStatusCode status) {
+        return switch (status.value()) {
+            case 301, 302, 303, 307, 308 -> true;
+            default -> false;
+        };
+    }
+
+    static HttpMethod redirectedMethod(
+            HttpStatusCode status,
+            HttpMethod method,
+            boolean preserveOriginal
+    ) {
+        if (preserveOriginal) return method;
+        if (status.value() == 303 && method != HttpMethod.HEAD) return HttpMethod.GET;
+        if ((status.value() == 301 || status.value() == 302) && method == HttpMethod.POST) {
+            return HttpMethod.GET;
+        }
+        return method;
+    }
+
+    static void applyRedirectHeaders(
+            HttpHeaders headers,
+            URI from,
+            URI to,
+            RequestSettings settings
+    ) {
+        if (!sameHost(from, to)) {
+            headers.remove(HttpHeaders.COOKIE);
+            headers.remove(HttpHeaders.PROXY_AUTHORIZATION);
+            if (!settings.followAuthHeader()) {
+                headers.remove(HttpHeaders.AUTHORIZATION);
+            }
+        }
+
+        if (settings.removeRefererOnRedirect()
+                || ("https".equalsIgnoreCase(from.getScheme())
+                && !"https".equalsIgnoreCase(to.getScheme()))) {
+            headers.remove(HttpHeaders.REFERER);
+        } else {
+            headers.set(HttpHeaders.REFERER, from.toString());
+        }
+    }
+
+    private static boolean sameHost(URI first, URI second) {
+        return first.getHost() != null
+                && second.getHost() != null
+                && first.getHost().equalsIgnoreCase(second.getHost());
+    }
+
+    private static String normalizedAcceptEncoding(String configured) {
+        if (configured == null || configured.isBlank()) {
+            return "";
+        }
+        return Arrays.stream(configured.split("[,\\s]+"))
+                .map(String::trim)
+                .map(String::toLowerCase)
+                .filter(coding -> coding.equals("gzip")
+                        || coding.equals("br")
+                        || coding.equals("brotli")
+                        || coding.equals("deflate"))
+                .map(coding -> coding.equals("brotli") ? "br" : coding)
+                .distinct()
+                .reduce((left, right) -> left + ", " + right)
+                .orElse("");
     }
 
     private WebClient.RequestHeadersSpec<?> buildBody(WebClient.RequestBodySpec requestSpec, ApiRequest request) {
@@ -163,8 +326,9 @@ public class RequestExecutor {
         return headers;
     }
 
-    private HttpClient buildHttpClient(RequestSettings s, DomainEntry tls) {
-        HttpClient client = HttpClient.create();
+    HttpClient buildHttpClient(RequestSettings s, DomainEntry tls, URI targetUri) {
+        HttpClient client = HttpClient.create()
+                .compress(!normalizedAcceptEncoding(s.acceptEncoding()).isBlank());
 
         SslContextBuilder ssl = SslContextBuilder.forClient();
 
@@ -229,7 +393,11 @@ public class RequestExecutor {
             String[] enabled = ALL_TLS.stream()
                     .filter(p -> !s.disabledTlsProtocols().contains(p))
                     .toArray(String[]::new);
-            if (enabled.length > 0) ssl.protocols(enabled);
+            if (enabled.length == 0) {
+                throw new IllegalArgumentException(
+                        "TLS configuration disables every supported protocol");
+            }
+            ssl.protocols(enabled);
         }
 
         if (s.cipherSuites() != null && !s.cipherSuites().isBlank()) {
@@ -244,23 +412,17 @@ public class RequestExecutor {
             var sslCtx = ssl.build();
             client = client.secure(spec -> spec.sslContext(sslCtx));
         } catch (Exception e) {
-            log.warn("SSL context build failed: {}", e.getMessage());
+            throw new IllegalArgumentException("Invalid TLS configuration: " + e.getMessage(), e);
         }
 
         client = switch (s.httpVersion() != null ? s.httpVersion() : "auto") {
             case "1.1" -> client.protocol(HttpProtocol.HTTP11);
-            case "2"   -> client.protocol(HttpProtocol.H2, HttpProtocol.HTTP11);
+            case "2"   -> client.protocol(
+                    "https".equalsIgnoreCase(targetUri.getScheme()) ? HttpProtocol.H2 : HttpProtocol.H2C);
             default    -> client;
         };
 
-        if (s.followRedirects()) {
-            client = client.followRedirect(true, req -> {
-                if (!s.followAuthHeader()) req.requestHeaders().remove(HttpHeaders.AUTHORIZATION);
-                if (s.removeRefererOnRedirect()) req.requestHeaders().remove(HttpHeaders.REFERER);
-            });
-        } else {
-            client = client.followRedirect(false);
-        }
+        client = client.followRedirect(false);
 
         client = client.httpResponseDecoder(spec -> spec.validateHeaders(s.strictHttpParser()));
 
