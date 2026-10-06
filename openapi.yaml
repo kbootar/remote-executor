@@ -10,6 +10,18 @@ info:
     The proxy receives a fully resolved HTTP request, applies server-side
     mTLS/CA configuration where configured, executes the outbound call via
     WebClient, and returns the response.
+
+    This document is the contract for a Kbootar Remote Executor. Any service
+    that implements `POST /api/execute` as described here can be used from the
+    app's Remote mode. `/mock` is specific to this reference implementation and
+    is not part of the contract.
+
+    **Unknown fields.** The app currently sends extra top-level properties
+    (`environment`, `proxySettings`, `bypass`) and extra `request` properties
+    (`id`, `collectionId`, `name`, `authConfig`). They are not part of the
+    contract; implementations must ignore them rather than reject the request.
+
+    **Authentication to the executor** is not yet defined by this spec.
   version: 0.1.0
   contact:
     name: Karanbir Singh
@@ -92,6 +104,38 @@ paths:
                     maxRedirects: 10
                     disabledTlsProtocols: []
                     cipherSuites: ""
+              base64_binary_put:
+                summary: Binary body (bodyEncoding = base64)
+                value:
+                  request:
+                    method: PUT
+                    url: "https://api.example.com/files/logo.png"
+                    headers:
+                      Content-Type: image/png
+                    body: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+                    bodyEncoding: base64
+                  settings:
+                    httpVersion: auto
+                    sslVerification: true
+              multipart_upload:
+                summary: multipart/form-data with a text field and a file
+                value:
+                  request:
+                    method: POST
+                    url: "https://api.example.com/upload"
+                    headers: {}
+                    multipartBody:
+                      - type: text
+                        name: description
+                        value: "Profile photo"
+                      - type: file
+                        name: file
+                        fileName: photo.png
+                        mimeType: image/png
+                        base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+                  settings:
+                    httpVersion: auto
+                    sslVerification: true
       responses:
         '200':
           description: |
@@ -102,9 +146,28 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProxyResponse'
         '400':
-          description: Invalid request payload
-        '500':
-          description: Proxy error (network failure, SSL context build failure, etc.)
+          description: Malformed request payload (for example, the body is not valid JSON).
+        '502':
+          description: |
+            The executor could not complete the outbound call: TLS handshake
+            failure, connection refused, timeout, an undecodable base64 body,
+            or any other execution error. A response from the target with a
+            4xx/5xx status is *not* an error here — it comes back as `200`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxyError'
+              examples:
+                tls:
+                  summary: TLS handshake failed
+                  value:
+                    error: SSL_HANDSHAKE_FAILED
+                    message: "TLS handshake failed connecting to the target: PKIX path building failed — if the server uses a self-signed or private CA certificate, set sslVerification: false in request settings."
+                refused:
+                  summary: Target unreachable
+                  value:
+                    error: CONNECTION_REFUSED
+                    message: "Could not connect to target: Connection refused"
 
   /mock:
     get:
@@ -236,6 +299,8 @@ components:
     ExecuteRequest:
       type: object
       required: [request, settings]
+      additionalProperties: true
+      description: Properties other than `request` and `settings` must be ignored.
       properties:
         request:
           $ref: '#/components/schemas/ApiRequest'
@@ -245,6 +310,14 @@ components:
     ApiRequest:
       type: object
       required: [method, url]
+      additionalProperties: true
+      description: |
+        Body selection, in order of precedence:
+        1. `multipartBody` (non-empty) — sent as `multipart/form-data`; the executor
+           generates the boundary and `Content-Type`, so any caller-supplied
+           `Content-Type` header is replaced.
+        2. `bodyEncoding: base64` — `body` is base64-decoded and sent as raw bytes.
+        3. Otherwise `body` is sent as-is (JSON, text, URL-encoded).
       properties:
         method:
           type: string
@@ -264,9 +337,41 @@ components:
             Authorization: "Bearer eyJhbGciOiJSUzI1NiJ9..."
             Content-Type: "application/json"
         body:
+          type: [string, "null"]
+          description: |
+            Request body string. Plain text unless `bodyEncoding` is `base64`.
+        bodyEncoding:
+          type: [string, "null"]
+          enum: [base64, null]
+          description: Set to `base64` when `body` holds base64-encoded binary content.
+        multipartBody:
+          type: [array, "null"]
+          items:
+            $ref: '#/components/schemas/MultipartPart'
+          description: Parts of a `multipart/form-data` request. Takes precedence over `body`.
+
+    MultipartPart:
+      type: object
+      required: [type, name]
+      properties:
+        type:
           type: string
-          nullable: true
-          description: Raw request body string.
+          enum: [text, file]
+        name:
+          type: string
+          description: Form field name.
+        value:
+          type: [string, "null"]
+          description: Field value. Used when `type` is `text`.
+        fileName:
+          type: [string, "null"]
+          description: Filename sent in the part's `Content-Disposition`. Falls back to `name` when empty.
+        mimeType:
+          type: [string, "null"]
+          description: Part content type. Falls back to `application/octet-stream` when empty.
+        base64:
+          type: [string, "null"]
+          description: Base64-encoded file bytes. Used when `type` is `file`.
 
     RequestSettings:
       type: object
@@ -332,6 +437,7 @@ components:
 
     ProxyResponse:
       type: object
+      required: [status, headers, setCookies, body, durationMs, resolvedUrl, httpVersion]
       properties:
         status:
           type: integer
@@ -341,24 +447,46 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Response headers from the target (collapsed to single string per name).
+          description: |
+            Response headers from the target, collapsed to one string per name.
+            `Set-Cookie` is also listed separately in `setCookies` so no cookie is lost.
         setCookies:
           type: array
           items:
             type: string
-          description: Raw `Set-Cookie` header values from the target response.
+          description: |
+            Raw `Set-Cookie` header values from the target, one entry per cookie.
+            Empty array when there are none. The app stores these in its cookie jar.
         body:
           type: string
-          nullable: true
+          description: Response body as text. Empty string when the target returned no body.
         durationMs:
           type: integer
           format: int64
-          description: End-to-end proxy duration in milliseconds.
+          description: End-to-end executor duration in milliseconds.
           example: 142
-        url:
+        resolvedUrl:
           type: string
-          description: The URL that was sent to the target.
+          description: |
+            The final URL the executor requested after URL encoding and any redirects.
+            May differ from the `url` in the request.
           example: "https://api.example.com/v1/users"
+        httpVersion:
+          type: string
+          description: HTTP version negotiated with the target, as reported by the client.
+          example: "HTTP/2"
+
+    ProxyError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [SSL_HANDSHAKE_FAILED, CONNECTION_REFUSED, TIMEOUT, PROXY_ERROR]
+          description: Stable error code. `PROXY_ERROR` is the catch-all.
+        message:
+          type: string
+          description: Human-readable detail. The app shows this to the user.
 
     MockEchoResponse:
       type: object
@@ -382,8 +510,8 @@ components:
             type: string
           description: Request headers (multi-value joined with `, `).
         body:
+          type: [string, "null"]
           description: Raw request body string, or `null` if no body.
-          nullable: true
         _kbootar:
           type: string
           enum: [mock]
