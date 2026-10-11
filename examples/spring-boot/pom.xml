@@ -12,10 +12,10 @@
     </parent>
 
     <groupId>in.neuw</groupId>
-    <artifactId>kbootar-proxy</artifactId>
+    <artifactId>remote-executor-spring-boot</artifactId>
     <version>0.1.0-SNAPSHOT</version>
-    <name>kbootar-proxy</name>
-    <description>Backend proxy server — resolves vars, manages auth, proxies requests</description>
+    <name>remote-executor-spring-boot</name>
+    <description>Reference Kbootar Remote Executor — executes resolved HTTP requests (POST /api/execute)</description>
 
     <properties>
         <java.version>21</java.version>
