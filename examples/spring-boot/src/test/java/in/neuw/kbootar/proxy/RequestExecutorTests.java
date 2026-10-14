@@ -105,8 +105,8 @@ class RequestExecutorTests {
 
         HttpHeaders stripped = redirectHeaders();
         RequestExecutor.applyRedirectHeaders(stripped, from, to, settings(false, false, 10));
-        assertFalse(stripped.containsKey(HttpHeaders.AUTHORIZATION));
-        assertFalse(stripped.containsKey(HttpHeaders.COOKIE));
+        assertFalse(stripped.containsHeader(HttpHeaders.AUTHORIZATION));
+        assertFalse(stripped.containsHeader(HttpHeaders.COOKIE));
 
         HttpHeaders sameHost = redirectHeaders();
         RequestExecutor.applyRedirectHeaders(
@@ -119,7 +119,7 @@ class RequestExecutorTests {
         HttpHeaders forwarded = redirectHeaders();
         RequestExecutor.applyRedirectHeaders(forwarded, from, to, settings(false, true, 10));
         assertEquals("Bearer secret", forwarded.getFirst(HttpHeaders.AUTHORIZATION));
-        assertFalse(forwarded.containsKey(HttpHeaders.COOKIE));
+        assertFalse(forwarded.containsHeader(HttpHeaders.COOKIE));
     }
 
     @Test
