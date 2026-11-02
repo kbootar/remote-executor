@@ -32,13 +32,14 @@ public class ExecuteController {
         long start = System.nanoTime();
         String id = http.getId();
         String target = describe(executeRequest.request());
+        log.info("execute id={} request {}", id, target);
         return requestExecutor.execute(executeRequest.request(), executeRequest.settings())
-                .doOnNext(response -> log.info("execute id={} {} -> {} in {}ms",
+                .doOnNext(response -> log.info("execute id={} response {} -> {} in {}ms",
                         id, target, response.status(), response.durationMs()))
                 .<ResponseEntity<?>>map(ResponseEntity::ok)
                 .onErrorResume(e -> {
                     ProxyError error = toError(e);
-                    log.warn("execute id={} {} failed: {} - {} ({}ms)",
+                    log.warn("execute id={} response {} failed: {} - {} ({}ms)",
                             id, target, error.error(), error.message(), (System.nanoTime() - start) / 1_000_000);
                     return Mono.just(ResponseEntity.status(502).body(error));
                 });

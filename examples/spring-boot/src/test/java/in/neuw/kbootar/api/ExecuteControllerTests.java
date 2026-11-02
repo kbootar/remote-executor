@@ -10,7 +10,13 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
+import com.sun.net.httpserver.HttpServer;
+
+import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -97,5 +103,41 @@ class ExecuteControllerTests {
         await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertThat(output.getOut())
                 .contains("WARN")
                 .contains("failed: CONNECTION_REFUSED"));
+    }
+
+    @Test
+    void logsTheRequestBeforeTheTargetResponds(CapturedOutput output) throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        HttpServer slowTarget = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        slowTarget.createContext("/slow", exchange -> {
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        slowTarget.start();
+        try {
+            int slowPort = slowTarget.getAddress().getPort();
+            String body = """
+                    {"request":{"method":"GET","url":"http://localhost:%d/slow","headers":{}},"settings":{}}
+                    """.formatted(slowPort);
+            CompletableFuture<Void> call = CompletableFuture.runAsync(() -> client.post().uri("/api/execute")
+                    .contentType(MediaType.APPLICATION_JSON).bodyValue(body).exchange().expectStatus().isOk());
+
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertThat(output.getOut())
+                    .contains("request GET http://localhost:" + slowPort + "/slow"));
+            assertThat(output.getOut()).as("the target has not answered yet").doesNotContain("-> 204");
+
+            release.countDown();
+            call.get(5, TimeUnit.SECONDS);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertThat(output.getOut())
+                    .contains("response GET http://localhost:" + slowPort + "/slow -> 204"));
+        } finally {
+            release.countDown();
+            slowTarget.stop(0);
+        }
     }
 }
