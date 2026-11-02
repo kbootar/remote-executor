@@ -43,9 +43,10 @@ class MockController {
             })
             .defaultIfEmpty("")
             .map(rawBody -> {
-                log.info("MOCK {} {} | params={} | headers={} | body={}",
-                    method, path, params.toSingleValueMap(),
-                    hdrs, rawBody.isEmpty() ? "(empty)" : rawBody);
+                // Names and sizes only: callers point real tokens at this endpoint while debugging.
+                // The echoed response below still carries the full values.
+                log.info("MOCK {} {} | params={} | headers={} | body={} bytes",
+                    method, path, params.keySet(), hdrs.keySet(), rawBody.length());
 
                 Map<String, Object> echo = new LinkedHashMap<>();
                 echo.put("method", method);

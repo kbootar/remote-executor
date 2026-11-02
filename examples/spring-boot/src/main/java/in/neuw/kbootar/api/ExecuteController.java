@@ -1,7 +1,10 @@
 package in.neuw.kbootar.api;
 
-import in.neuw.kbootar.proxy.ProxyResponse;
+import in.neuw.kbootar.collection.ApiRequest;
 import in.neuw.kbootar.proxy.RequestExecutor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -10,10 +13,13 @@ import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
 import javax.net.ssl.SSLHandshakeException;
+import java.net.URI;
 
 @RestController
 @RequestMapping("/api")
 public class ExecuteController {
+
+    private static final Logger log = LoggerFactory.getLogger(ExecuteController.class);
 
     private final RequestExecutor requestExecutor;
 
@@ -22,10 +28,35 @@ public class ExecuteController {
     }
 
     @PostMapping("/execute")
-    Mono<ResponseEntity<?>> execute(@RequestBody ExecuteRequest executeRequest) {
+    Mono<ResponseEntity<?>> execute(@RequestBody ExecuteRequest executeRequest, ServerHttpRequest http) {
+        long start = System.nanoTime();
+        String id = http.getId();
+        String target = describe(executeRequest.request());
         return requestExecutor.execute(executeRequest.request(), executeRequest.settings())
+                .doOnNext(response -> log.info("execute id={} {} -> {} in {}ms",
+                        id, target, response.status(), response.durationMs()))
                 .<ResponseEntity<?>>map(ResponseEntity::ok)
-                .onErrorResume(e -> Mono.just(ResponseEntity.status(502).body(toError(e))));
+                .onErrorResume(e -> {
+                    ProxyError error = toError(e);
+                    log.warn("execute id={} {} failed: {} - {} ({}ms)",
+                            id, target, error.error(), error.message(), (System.nanoTime() - start) / 1_000_000);
+                    return Mono.just(ResponseEntity.status(502).body(error));
+                });
+    }
+
+    // Method, host and path only: query strings and userinfo routinely carry credentials.
+    private static String describe(ApiRequest request) {
+        if (request == null) {
+            return "<no request>";
+        }
+        try {
+            URI uri = URI.create(request.url());
+            String port = uri.getPort() != -1 ? ":" + uri.getPort() : "";
+            String query = uri.getRawQuery() != null ? "?..." : "";
+            return request.method() + " " + uri.getScheme() + "://" + uri.getHost() + port + uri.getRawPath() + query;
+        } catch (RuntimeException e) {
+            return request.method() + " <unparseable url>";
+        }
     }
 
     private static ProxyError toError(Throwable e) {
