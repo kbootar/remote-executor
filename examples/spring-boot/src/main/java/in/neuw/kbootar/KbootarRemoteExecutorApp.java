@@ -7,9 +7,9 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 
 @SpringBootApplication
 @EnableConfigurationProperties(DomainTlsProperties.class)
-public class KbootarApplication {
+public class KbootarRemoteExecutorApp {
 
     public static void main(String[] args) {
-        SpringApplication.run(KbootarApplication.class, args);
+        SpringApplication.run(KbootarRemoteExecutorApp.class, args);
     }
 }
