@@ -27,6 +27,14 @@ It listens on `http://localhost:8080`. In the app, switch to Remote mode and ent
 
 `/mock/**` is a debugging echo endpoint specific to this example. It is not part of the contract.
 
+## Securing the executor
+
+The reference app has no authentication of its own. Run it behind a reverse proxy that terminates TLS and enforces auth, and expose only `POST /api/execute` (never `/mock`). It fetches any URL it is asked to, so keep it reachable only by callers you trust.
+
+The Kbootar app can authenticate to the executor with Basic Auth, an API key header, or a Bearer token. Choose one in the app's Remote Executor settings and enforce the same scheme at your proxy; the app sends it as an ordinary request header on every call. OAuth2 and client-certificate (mTLS) options appear in the dialog but are not applied to the executor connection yet.
+
+![Remote Executor settings in the Kbootar app](docs/remote-executor-settings.webp)
+
 ## Writing your own
 
 1. Implement `POST /api/execute` as described in `openapi.yaml`.
