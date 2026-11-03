@@ -40,3 +40,4 @@ The Kbootar app can authenticate to the executor with Basic Auth, an API key hea
 1. Implement `POST /api/execute` as described in `openapi.yaml`.
 2. Ignore unknown request properties. The app sends extra fields that are not part of the contract.
 3. Return `200` with a `ProxyResponse` whenever the target answered, even with a 4xx or 5xx. Use `502` with a `ProxyError` only when the call itself could not be completed.
+4. Don't implement OAuth. For a request that uses OAuth2 client credentials the app makes two ordinary calls through the executor: first a form-encoded `POST` to the identity provider's token URL, then the resource request with `Authorization: Bearer <token>`. The executor only needs to be able to reach the identity provider, and it sees the client credentials in the first call.
