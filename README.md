@@ -31,7 +31,7 @@ It listens on `http://localhost:8080`. In the app, switch to Remote mode and ent
 
 The reference app has no authentication of its own. Run it behind a reverse proxy that terminates TLS and enforces auth, and expose only `POST /api/execute` (never `/mock`). It fetches any URL it is asked to, so keep it reachable only by callers you trust.
 
-The Kbootar app can authenticate to the executor with Basic Auth, an API key header, or a Bearer token. Choose one in the app's Remote Executor settings and enforce the same scheme at your proxy; the app sends it as an ordinary request header on every call. OAuth2 and client-certificate (mTLS) options appear in the dialog but are not applied to the executor connection yet.
+The Kbootar app can authenticate to the executor with Basic Auth, an API key header, or a Bearer token. Choose one in the app's Remote Executor settings and enforce the same scheme at your proxy; the app sends it as an ordinary request header on every call. For mutual TLS, have your proxy require client certificates on the executor's hostname and add a matching client certificate for that hostname in the app's certificate store; the app presents it automatically. The OAuth2 option in the dialog is not applied to the executor connection yet.
 
 ![Remote Executor settings in the Kbootar app](docs/remote-executor-settings.webp)
 
